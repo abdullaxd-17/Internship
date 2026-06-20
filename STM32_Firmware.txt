@@ -1,0 +1,594 @@
+/* =============================================================================
+ * STM32L432KC  â€”  MAX31865 (x2) â†’ UART â†’ Heltec Wireless Stick
+ * =============================================================================
+ *
+ * MAX31865 is an RTD-to-digital converter for PT100 / PT1000 sensors.
+ * Unlike MAX31855 it has a writable configuration register and needs MOSI.
+ *
+ * WIRING
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MAX31865 #1          STM32L432KC
+ *   VCC       â”€â”€â”€â”€â”€â”€â–º  3.3V
+ *   GND       â”€â”€â”€â”€â”€â”€â–º  GND
+ *   CLK/SCK   â—„â”€â”€â”€â”€â”€â”€  PA5  (SPI1_SCK,  AF5)
+ *   SDO/MISO  â”€â”€â”€â”€â”€â”€â–º  PA6  (SPI1_MISO, AF5)
+ *   SDI/MOSI  â—„â”€â”€â”€â”€â”€â”€  PA7  (SPI1_MOSI, AF5)   â† NEW vs MAX31855
+ *   CS        â—„â”€â”€â”€â”€â”€â”€  PA4  (GPIO output, active-LOW)
+ *
+ * MAX31865 #2          STM32L432KC
+ *   VCC       â”€â”€â”€â”€â”€â”€â–º  3.3V
+ *   GND       â”€â”€â”€â”€â”€â”€â–º  GND
+ *   CLK/SCK   â—„â”€â”€â”€â”€â”€â”€  PA5  (shared)
+ *   SDO/MISO  â”€â”€â”€â”€â”€â”€â–º  PA6  (shared)
+ *   SDI/MOSI  â—„â”€â”€â”€â”€â”€â”€  PA7  (shared)
+ *   CS        â—„â”€â”€â”€â”€â”€â”€  PB0  (GPIO output, active-LOW)
+ *
+ * Heltec Wireless Stick   STM32L432KC
+ *   GPIO16 (Serial2 RX) â—„â”€â”€ PA9   (USART1_TX, AF7)
+ *   GPIO17 (Serial2 TX) â”€â”€â–º PA10  (USART1_RX, AF7)
+ *   GND                 â”€â”€â”€â”€ GND  (common ground required!)
+ *
+ * MAX31865 BREAKOUT JUMPERS (if using Adafruit-style board):
+ *   2-wire or 4-wire PT100: solder 2/4 wire jumper (leave 3-wire open)
+ *   3-wire PT100           : solder 3-wire jumper
+ *   PT1000                 : change PT_R0 and PT_RREF below
+ *
+ * SPI MODE: Mode 3  (CPOL=1, CPHA=1) â€” MAX31865 requires this
+ *
+ * UART FRAME FORMAT (sent every 2 seconds):
+ *   "T1:25.75,T2:26.50\r\n"
+ *   Fault returns -999.00
+ *
+ * CLOCK: MSI 4 MHz â†’ PLL â†’ 80 MHz SYSCLK
+ * ''=============================================================================
+ */
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>   /* sqrtf */
+
+/* â”€â”€ Peripheral handles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+SPI_HandleTypeDef  hspi1;
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* â”€â”€ CS pin aliases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+#define CS1_PORT  GPIOA
+#define CS1_PIN   GPIO_PIN_4
+#define CS2_PORT  GPIOB
+#define CS2_PIN   GPIO_PIN_0
+
+/* â”€â”€ MAX31865 register addresses â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+#define REG_CONFIG      0x00
+#define REG_RTD_MSB     0x01
+#define REG_RTD_LSB     0x02
+#define REG_HF_MSB      0x03
+#define REG_HF_LSB      0x04
+#define REG_LF_MSB      0x05
+#define REG_LF_LSB      0x06
+#define REG_FAULT       0x07
+#define WRITE_BIT       0x80   /* OR address with this to write */
+
+/* â”€â”€ MAX31865 configuration byte â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/*
+ *  Bit 7  VBIAS       1 = bias voltage ON  (must be ON for conversion)
+ *  Bit 6  Auto/1shot  1 = continuous auto-convert
+ *  Bit 5  1-shot      0 (unused in auto mode)
+ *  Bit 4  3-wire      0 = 2-wire or 4-wire  |  1 = 3-wire
+ *  Bit 3-2 FaultDetect 00 = no action
+ *  Bit 1  FaultClear  0
+ *  Bit 0  50/60 Hz    1 = 50 Hz filter  |  0 = 60 Hz filter
+ *
+ *  0xC1 = VBIAS=1, Auto=1, 2/4-wire, 50 Hz  â† suitable for most setups
+ *  0xD1 = same but 3-wire
+ *  0xC0 = VBIAS=1, Auto=1, 2/4-wire, 60 Hz  (change for 60 Hz countries)
+ */
+#define MAX31865_CONFIG   0xC1   /* 2/4-wire, 50 Hz filter, auto-convert */
+
+/* â”€â”€ RTD sensor constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/*
+ *  For PT100  : PT_R0 = 100.0,  PT_RREF = 430.0  (typical 430Î© reference)
+ *  For PT1000 : PT_R0 = 1000.0, PT_RREF = 4300.0 (typical 4.3kÎ© reference)
+ *  Change these to match your breakout board's reference resistor.
+ */
+#define PT_R0       100.0f    /* RTD resistance at 0 Â°C (Î©) */
+#define PT_RREF     430.0f    /* Reference resistor on breakout board (Î©) */
+
+/* Callendar-Van Dusen coefficients (IEC 60751 standard) */
+#define CVD_A    3.9083e-3f
+#define CVD_B   -5.775e-7f
+#define CVD_C   -4.183e-12f  /* used only for T < 0 Â°C */
+
+/* â”€â”€ Function prototypes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void  SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+
+void    MAX31865_Init(GPIO_TypeDef *cs_port, uint16_t cs_pin);
+uint8_t MAX31865_ReadReg(GPIO_TypeDef *cs_port, uint16_t cs_pin, uint8_t reg);
+void    MAX31865_WriteReg(GPIO_TypeDef *cs_port, uint16_t cs_pin,
+                          uint8_t reg, uint8_t value);
+float   MAX31865_ReadTemperature(GPIO_TypeDef *cs_port, uint16_t cs_pin);
+float   RTD_ToTemperature(float rtd_resistance);
+void    UART_SendString(const char *str);
+void    UART_SendData(float t1, float t2);
+
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• main â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_SPI1_Init();
+    MX_USART1_UART_Init();
+    MX_USART2_UART_Init();
+
+    HAL_Delay(500);
+    
+    UART_SendString("\r\n=== STM32L432KC + MAX31865 Temperature Logger ===\r\n");
+    UART_SendString("Dual RTD Temperature Measurement\r\n");
+    UART_SendString("Baud: 115200 | Sample: 2s\r\n\r\n");
+
+    /* De-select both sensors */
+    HAL_GPIO_WritePin(CS1_PORT, CS1_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(CS2_PORT, CS2_PIN, GPIO_PIN_SET);
+
+    /* Configure both MAX31865 chips */
+    MAX31865_Init(CS1_PORT, CS1_PIN);
+    //MAX31865_Init(CS2_PORT, CS2_PIN);  /* SENSOR 2 IS BROKEN - DISABLED */
+
+    UART_SendString("MAX31865 Sensor 1 initialized (Sensor 2 is faulty)\r\n");
+    HAL_Delay(500);  /* Wait for first conversion to complete */
+
+    while (1)
+    {
+        float t1 = MAX31865_ReadTemperature(CS1_PORT, CS1_PIN);
+        //float t2 = MAX31865_ReadTemperature(CS2_PORT, CS2_PIN);  /* SENSOR 2 IS BROKEN - SKIP */
+        
+        /* Format output for Heltec: T1:25.50,T2:XX.XX\r\n */
+        char buffer[100];
+        
+        int t1_int = (int)t1;
+        int t1_frac = (int)(fabsf(t1 - t1_int) * 100);
+        
+        sprintf(buffer, "T1:%d.%02d,T2:0.00\r\n", 
+                t1_int, t1_frac);
+        UART_SendString(buffer);
+        
+        HAL_Delay(2000);
+    }
+}
+
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• MAX31865 Driver Functions â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MAX31865_Init
+ *   Writes the configuration register to enable VBIAS and
+ *   start continuous auto-conversion mode.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void MAX31865_Init(GPIO_TypeDef *cs_port, uint16_t cs_pin)
+{
+    char cs_name[10];
+    if (cs_port == GPIOA && cs_pin == GPIO_PIN_4)
+        strcpy(cs_name, "CS1/PA4");
+    else if (cs_port == GPIOB && cs_pin == GPIO_PIN_0)
+        strcpy(cs_name, "CS2/PB0");
+    else
+        strcpy(cs_name, "UNKNOWN");
+
+    char msg[100];
+    sprintf(msg, "[INIT] Initializing %s...\r\n", cs_name);
+    UART_SendString(msg);
+
+    /* Enable VBIAS and start auto-conversion */
+    MAX31865_WriteReg(cs_port, cs_pin, REG_CONFIG, MAX31865_CONFIG);
+    HAL_Delay(150);   /* Wait for VBIAS to stabilize and first conversion */
+    
+    /* Verify config was written */
+    uint8_t config = MAX31865_ReadReg(cs_port, cs_pin, REG_CONFIG);
+    sprintf(msg, "[INIT] %s Config reg = 0x%02X (expected 0xC1)\r\n", cs_name, config);
+    UART_SendString(msg);
+
+    if (config != MAX31865_CONFIG)
+    {
+        sprintf(msg, "[ERROR] %s config write FAILED! Check power, CS line, and SPI!\r\n", cs_name);
+        UART_SendString(msg);
+    }
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MAX31865_WriteReg
+ *   Writes one byte to a MAX31865 register.
+ *   Address byte is OR'd with 0x80 to signal a write operation.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void MAX31865_WriteReg(GPIO_TypeDef *cs_port, uint16_t cs_pin,
+                       uint8_t reg, uint8_t value)
+{
+    uint8_t tx[2] = { (uint8_t)(reg | WRITE_BIT), value };
+    
+    char debug_buf[100];
+    sprintf(debug_buf, "[SPI_WRITE] CS toggling... Reg=0x%02X, Val=0x%02X\r\n", reg, value);
+    UART_SendString(debug_buf);
+
+    HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_RESET);  /* CS LOW */
+    HAL_Delay(1);
+    
+    HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi1, tx, 2, 50);
+    if (status != HAL_OK)
+        UART_SendString("[ERROR] SPI_Transmit failed!\r\n");
+    
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_SET);    /* CS HIGH */
+    
+    sprintf(debug_buf, "[SPI_WRITE] Done\r\n");
+    UART_SendString(debug_buf);
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MAX31865_ReadReg
+ *   Reads one byte from a MAX31865 register.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+uint8_t MAX31865_ReadReg(GPIO_TypeDef *cs_port, uint16_t cs_pin, uint8_t reg)
+{
+    uint8_t addr = reg & 0x7F;   /* read: MSB = 0 */
+    uint8_t rx   = 0;
+
+    HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_RESET);
+    HAL_SPI_Transmit(&hspi1, &addr, 1, 50);
+    HAL_SPI_Receive (&hspi1, &rx,   1, 50);
+    HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_SET);
+
+    return rx;
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MAX31865_ReadTemperature
+ *   Reads the 15-bit RTD ADC result, converts to resistance,
+ *   then to temperature using Callendar-Van Dusen.
+ *
+ *   RTD register layout (two bytes, address 0x01-0x02):
+ *   [15:1]  15-bit ADC value  (MSB first)
+ *   [0]     Fault flag        (1 = fault present)
+ *
+ *   Returns -999.0f on fault.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+float MAX31865_ReadTemperature(GPIO_TypeDef *cs_port, uint16_t cs_pin)
+{
+    /* Burst-read RTD MSB and LSB in one transaction */
+    uint8_t addr   = REG_RTD_MSB & 0x7F;
+    uint8_t rx[2]  = {0, 0};
+
+    char cs_name[10];
+    if (cs_port == GPIOA && cs_pin == GPIO_PIN_4)
+        strcpy(cs_name, "CS1/PA4");
+    else if (cs_port == GPIOB && cs_pin == GPIO_PIN_0)
+        strcpy(cs_name, "CS2/PB0");
+    else
+        strcpy(cs_name, "UNKNOWN");
+
+    HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_RESET);
+    HAL_SPI_Transmit(&hspi1, &addr,  1, 50);
+    HAL_SPI_Receive (&hspi1,  rx,    2, 50);
+    HAL_GPIO_WritePin(cs_port, cs_pin, GPIO_PIN_SET);
+
+    /* Bit 0 of LSB is the fault flag */
+    if (rx[1] & 0x01)
+    {
+        /* Read fault register for diagnosis */
+        uint8_t fault = MAX31865_ReadReg(cs_port, cs_pin, REG_FAULT);
+        char buf[100];
+        sprintf(buf, "FAULT DETECTED! Reg=0x%02X\r\n", fault);
+        UART_SendString(buf);
+        return -999.0f;
+    }
+
+    /* Combine bytes into 15-bit ADC value (drop fault bit) */
+    uint16_t adc_code = (uint16_t)(((uint16_t)rx[0] << 8) | rx[1]) >> 1;
+
+    /* Convert ADC code â†’ RTD resistance
+     *   R_rtd = adc_code * R_ref / 32768
+     *   32768 = 2^15 (full-scale for 15-bit ADC)                        */
+    float r_rtd = (float)adc_code * PT_RREF / 32768.0f;
+    
+    /* DEBUG: Print raw values */
+    char debug_buf[100];
+    int adc_int = (int)adc_code;
+    int r_rtd_int = (int)r_rtd;
+    int r_rtd_frac = (int)((r_rtd - r_rtd_int) * 100);
+    sprintf(debug_buf, "[DEBUG] %s ADC=0x%04X (%d) | R_rtd=%d.%02d Ohm\r\n", 
+            cs_name, adc_code, adc_int, r_rtd_int, r_rtd_frac);
+    UART_SendString(debug_buf);
+
+    /* Sensor malfunction detection */
+    if (adc_code < 500)
+    {
+        sprintf(debug_buf, "[WARN] %s ADC very low! Check: 1) PT100 connected? 2) CS toggling? 3) Power supply?\r\n", cs_name);
+        UART_SendString(debug_buf);
+    }
+    if (adc_code > 32500)
+    {
+        sprintf(debug_buf, "[WARN] %s ADC very high! Check: 1) Sensor disconnected? 2) Reference resistor OK?\r\n", cs_name);
+        UART_SendString(debug_buf);
+    }
+
+    return RTD_ToTemperature(r_rtd);
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * RTD_ToTemperature
+ *   Converts RTD resistance to Â°C using the Callendar-Van Dusen equation.
+ *
+ *   For T â‰¥ 0 Â°C:  Rt = R0(1 + AÂ·T + BÂ·TÂ²)
+ *     Solving quadratic:  T = (âˆ’A + âˆš(AÂ²âˆ’4B(1âˆ’Rt/R0))) / (2B)
+ *
+ *   For T < 0 Â°C:  Exact CVD has a 4th-degree term (coefficient C).
+ *     Below uses a linearised approximation valid to about âˆ’50 Â°C.
+ *     For accuracy below âˆ’50 Â°C replace with a Newton-Raphson iteration.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+float RTD_ToTemperature(float r_rtd)
+{
+    float z1, z2, z3, z4, temp;
+
+    z1 = -CVD_A;
+    z2 = CVD_A * CVD_A - 4.0f * CVD_B;
+    z3 = (4.0f * CVD_B) / PT_R0;
+    z4 = 2.0f * CVD_B;
+
+    temp = z2 + z3 * r_rtd;
+    temp = (sqrtf(temp) + z1) / z4;
+
+    if (temp >= 0.0f)
+        return temp;
+
+    /* Below 0 Â°C: use polynomial approximation (accurate to ~Â±0.5 Â°C) */
+    float rpoly = r_rtd;
+    temp  = -242.02f;
+    temp +=   2.2228f  * rpoly;
+    rpoly *= r_rtd;   /* rÂ² */
+    temp +=   2.5859e-3f * rpoly;
+    rpoly *= r_rtd;   /* rÂ³ */
+    temp -=   4.8260e-6f * rpoly;
+    rpoly *= r_rtd;   /* râ´ */
+    temp -=   2.8183e-8f * rpoly;
+    rpoly *= r_rtd;   /* râµ */
+    temp +=   1.5243e-10f * rpoly;
+
+    return temp;
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * UART_SendData
+ *   Transmits both temperatures as an ASCII CSV frame over USART1.
+ *   Example: "T1:25.75,T2:26.50\r\n"
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void UART_SendData(float t1, float t2)
+{
+    char buf[64];
+    int  len = snprintf(buf, sizeof(buf), "T1:%.2f,T2:%.2f\r\n", t1, t2);
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)len, 1000);
+}
+
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• Peripheral Init â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * SystemClock_Config
+ *   MSI 4 MHz â†’ PLL (Ã—40 / 2) â†’ SYSCLK = 80 MHz
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+
+    if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+        Error_Handler();
+
+    osc.OscillatorType      = RCC_OSCILLATORTYPE_MSI;
+    osc.MSIState            = RCC_MSI_ON;
+    osc.MSICalibrationValue = 0;
+    osc.MSIClockRange       = RCC_MSIRANGE_6;   /* 4 MHz */
+    osc.PLL.PLLState        = RCC_PLL_ON;
+    osc.PLL.PLLSource       = RCC_PLLSOURCE_MSI;
+    osc.PLL.PLLM            = 1;
+    osc.PLL.PLLN            = 40;
+    osc.PLL.PLLR            = 2;    /* SYSCLK = 80 MHz */
+    osc.PLL.PLLP            = 7;
+    osc.PLL.PLLQ            = 4;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK)
+        Error_Handler();
+
+    clk.ClockType      = RCC_CLOCKTYPE_HCLK  | RCC_CLOCKTYPE_SYSCLK |
+                         RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV1;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK)
+        Error_Handler();
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MX_GPIO_Init
+ *   PA4  â€” CS1           output, start HIGH
+ *   PB0  â€” CS2           output, start HIGH
+ *   PA5  â€” SPI1_SCK      AF5
+ *   PA6  â€” SPI1_MISO     AF5
+ *   PA7  â€” SPI1_MOSI     AF5   â† required for MAX31865 (write registers)
+ *   PA2  â€” USART2_TX     AF7   â† ST-LINK virtual COM port
+ *   PA3  â€” USART2_RX     AF7   â† ST-LINK virtual COM port
+ *   PA9  â€” USART1_TX     AF7
+ *   PA10 â€” USART1_RX     AF7   â† Heltec Wireless Stick
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_SPI1_CLK_ENABLE();
+    __HAL_RCC_USART1_CLK_ENABLE();
+    __HAL_RCC_USART2_CLK_ENABLE();
+
+    /* â”€â”€ CS1 (PA4) â”€â”€ */
+    g.Pin   = CS1_PIN;
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(CS1_PORT, &g);
+    HAL_GPIO_WritePin(CS1_PORT, CS1_PIN, GPIO_PIN_SET);
+
+    /* â”€â”€ CS2 (PB0) â”€â”€ */
+    g.Pin = CS2_PIN;
+    HAL_GPIO_Init(CS2_PORT, &g);
+    HAL_GPIO_WritePin(CS2_PORT, CS2_PIN, GPIO_PIN_SET);
+
+    /* â”€â”€ SPI1: PA5 (SCK), PA6 (MISO), PA7 (MOSI) â€” AF5 â”€â”€ */
+    g.Pin       = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF5_SPI1;
+    HAL_GPIO_Init(GPIOA, &g);
+
+    /* â”€â”€ USART1: PA9 (TX), PA10 (RX) â€” AF7 â”€â”€ */
+    g.Pin       = GPIO_PIN_9 | GPIO_PIN_10;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_PULLUP;
+    g.Speed     = GPIO_SPEED_FREQ_HIGH;
+    g.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &g);
+
+    /* â”€â”€ USART2: PA2 (TX), PA3 (RX) â€” AF7 â€” for ST-LINK VCP â”€â”€ */
+    g.Pin       = GPIO_PIN_2 | GPIO_PIN_3;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_PULLUP;
+    g.Speed     = GPIO_SPEED_FREQ_HIGH;
+    g.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &g);
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MX_SPI1_Init
+ *   SPI Mode 3: CPOL=1, CPHA=1  (MAX31865 requires this â€” clock idles HIGH,
+ *               data sampled on falling edge)
+ *   Full-duplex (needs MOSI to write config register)
+ *   8-bit, MSB first
+ *   Clock: 80 MHz / 32 = 2.5 MHz  (MAX31865 max = 5 MHz)
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+static void MX_SPI1_Init(void)
+{
+    hspi1.Instance               = SPI1;
+    hspi1.Init.Mode              = SPI_MODE_MASTER;
+    hspi1.Init.Direction         = SPI_DIRECTION_2LINES;      /* full duplex */
+    hspi1.Init.DataSize          = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity       = SPI_POLARITY_HIGH;   /* CPOL=1 */
+    hspi1.Init.CLKPhase          = SPI_PHASE_2EDGE;     /* CPHA=1 â€” Mode 3 */
+    hspi1.Init.NSS               = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;  /* 2.5 MHz */
+    hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.NSSPMode          = SPI_NSS_PULSE_DISABLE;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK)
+        Error_Handler();
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MX_USART1_UART_Init
+ *   115200 baud, 8-N-1, no hardware flow control
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = 115200;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+        Error_Handler();
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * MX_USART2_UART_Init
+ *   115200 baud, 8-N-1, for ST-LINK virtual COM port
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance          = USART2;
+    huart2.Init.BaudRate     = 115200;
+    huart2.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits     = UART_STOPBITS_1;
+    huart2.Init.Parity       = UART_PARITY_NONE;
+    huart2.Init.Mode         = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+        Error_Handler();
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * Error_Handler
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void Error_Handler(void)
+{
+    /* Send error indicator before looping */
+    char err_msg[] = "ERROR\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)err_msg, sizeof(err_msg)-1, 1000);
+    
+    __disable_irq();
+    while (1) {}
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * UART_SendString
+ *   Send string via USART1 (PA9/PA10) and USART2 (PA2/PA3)
+ *   This enables viewing on both Heltec and ST-LINK COM ports
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void UART_SendString(const char *str)
+{
+    uint16_t len = 0;
+    while (str[len] != '\0')
+        len++;
+    
+    /* Send to USART1 (Heltec) */
+    HAL_UART_Transmit(&huart1, (uint8_t*)str, len, 1000);
+    
+    /* Send to USART2 (ST-LINK COM3) */
+    HAL_UART_Transmit(&huart2, (uint8_t*)str, len, 1000);
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * __io_putchar
+ *   Implementation of the weak function declared in syscalls.c.
+ *   Sends characters via both USART1 and USART2.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+int __io_putchar(int ch)
+{
+    uint8_t byte = (uint8_t)ch;
+    HAL_UART_Transmit(&huart1, &byte, 1, 1000);
+    HAL_UART_Transmit(&huart2, &byte, 1, 1000);
+    return ch;
+}
+
+/* =============================================================================
+ * MAX31865 FAULT REGISTER BITS (REG_FAULT = 0x07)
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * Bit 7: RTD High Threshold fault
+ * Bit 6: RTD Low Threshold fault
+ * Bit 5: REFinâˆ’ > 0.85 Ã— VBIAS (REFIN open)
+ * Bit 4: REFinâˆ’ < 0.85 Ã— VBIAS, FORCEâˆ’ open
+ * Bit 3: RTDinâˆ’ < 0.85 Ã— VBIAS, FORCEâˆ’ open  (RTD open / not connected)
+ * Bit 2: Overvoltage / undervoltage fault
+ * Bits 1-0: Reserved
+ *
+ * To clear faults after reading: write 0x02 to config register (Fault Clear bit)
+ *   MAX31865_WriteReg(cs_port, cs_pin, REG_CONFIG, MAX31865_CONFIG | 0x02);
+ *   HAL_Delay(1);
+ *   MAX31865_WriteReg(cs_port, cs_pin, REG_CONFIG, MAX31865_CONFIG);
+ * =============================================================================
+ */

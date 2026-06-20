@@ -1,0 +1,247 @@
+/* =============================================================================
+ * Heltec Wireless Stick (ESP32 + SX1276)
+ * Receives temperature data from STM32 via UART, re-transmits over LoRa
+ * =============================================================================
+ *
+ * WIRING
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * Heltec GPIO9  (Serial2 RX) â—„â”€â”€ STM32 PA9  TX
+ * Heltec GPIO10 (Serial2 TX) â”€â”€â–º STM32 PA10 RX
+ * Heltec GND                 â”€â”€â–º STM32 GND   â† MUST be connected!
+ * Power Heltec from USB (5V); power STM32 separately (3.3V regulator or USB).
+ *
+ * LoRa radio is wired INTERNALLY on the Heltec board:
+ *   SX1276 SCK  = GPIO5
+ *   SX1276 MISO = GPIO19
+ *   SX1276 MOSI = GPIO27
+ *   SX1276 NSS  = GPIO18
+ *   SX1276 RST  = GPIO14
+ *   SX1276 DIO0 = GPIO26
+ *
+ * ARDUINO IDE SETUP
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * 1. Add board package URL in Preferences:
+ *    https://resource.heltec.cn/download/package_heltec_esp32_index.json
+ * 2. Install "Heltec ESP32 Series Dev-boards" via Boards Manager
+ * 3. Select board: "Wireless Stick"
+ * 4. Install library: "LoRa" by Sandeep Mistry  (Library Manager)
+ *
+ * UART FRAME FORMAT (received from STM32):
+ *   "T1:25.75,T2:26.50\r\n"
+ *
+ * LORA PACKET FORMAT (transmitted):
+ *   Same string: "T1:25.75,T2:26.50"
+ *
+ * FREQUENCY
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ *   Europe / South Asia / Pakistan: 868E6  (868 MHz)
+ *   Americas                       : 915E6  (915 MHz)
+ *   Global ISM fallback            : 433E6  (433 MHz)
+ *   Change LORA_FREQUENCY below to match your region and antenna.
+ * =============================================================================
+ */
+
+#include <SPI.h>
+#include <LoRa.h>
+
+/* â”€â”€ LoRa radio pins (built into Heltec Wireless Stick) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+#define LORA_SCK    5
+#define LORA_MISO  19
+#define LORA_MOSI  27
+#define LORA_NSS   18
+#define LORA_RST   14
+#define LORA_DIO0  26
+
+/* â”€â”€ UART2 pins (connect to STM32) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+#define UART2_RX   9    /* â—„â”€â”€ STM32 PA9  TX */
+#define UART2_TX   10   /* â”€â”€â–º STM32 PA10 RX */
+
+/* â”€â”€ LoRa radio settings â€” adjust for your region â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+#define LORA_FREQUENCY    868E6   /* Hz: 868E6 (EU/Asia), 915E6 (US), 433E6 */
+#define LORA_BANDWIDTH    125E3   /* Hz: 125 kHz  (good range/speed balance) */
+#define LORA_SPREADING    7       /* SF7 = fastest; SF12 = longest range     */
+#define LORA_CODING_RATE  5       /* 4/5 coding rate                         */
+#define LORA_TX_POWER     17      /* dBm: 2â€“20 (SX1276 max is 20 dBm)        */
+#define LORA_SYNC_WORD    0x12    /* 0x12 = private network; 0x34 = LoRaWAN  */
+
+/* â”€â”€ Internal state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+static String  rxBuffer     = "";
+static uint32_t packetCount  = 0;
+static uint32_t lastRxMs     = 0;
+static uint32_t lastWaitMs   = 0;
+
+/*
+ * Set this to 1 only if you want to see every raw character from STM32.
+ * Normally keep it 0, because framed output is cleaner.
+ */
+#define DEBUG_RAW_UART  0
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void setup()
+{
+    /* USB serial for debug output */
+    Serial.begin(115200);
+    while (!Serial && millis() < 3000);   /* wait up to 3 s for USB monitor */
+    Serial.println("\n[BOOT] Heltec Wireless Stick â€” STM32 LoRa bridge");
+
+    /* UART2: receive temperature strings from STM32 */
+    Serial2.begin(115200, SERIAL_8N1, UART2_RX, UART2_TX);
+    Serial.println("[OK]   UART2 ready  (RX=GPIO9, TX=GPIO10, 115200 baud)");
+
+    /* Initialise SPI bus for the on-board SX1276 */
+    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+    /* Assign LoRa control pins */
+    LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
+
+    /* Start LoRa radio */
+    if (!LoRa.begin(LORA_FREQUENCY))
+    {
+        Serial.println("[ERR]  LoRa init FAILED â€” check antenna and wiring!");
+        while (true) delay(1000);   /* halt */
+    }
+
+    /* Configure radio parameters */
+    LoRa.setSignalBandwidth(LORA_BANDWIDTH);
+    LoRa.setSpreadingFactor(LORA_SPREADING);
+    LoRa.setCodingRate4(LORA_CODING_RATE);
+    LoRa.setTxPower(LORA_TX_POWER);
+    LoRa.setSyncWord(LORA_SYNC_WORD);
+    LoRa.enableCrc();               /* enable CRC for error detection */
+
+    Serial.print("[OK]   LoRa ready  freq=");
+    Serial.print((long)LORA_FREQUENCY / 1000000);
+    Serial.print(" MHz  SF=");
+    Serial.print(LORA_SPREADING);
+    Serial.print("  BW=");
+    Serial.print((long)LORA_BANDWIDTH / 1000);
+    Serial.println(" kHz");
+
+    Serial.println("[WAIT] Listening for STM32 UART data...");
+    Serial.println("[INFO] Open this Heltec USB Serial Monitor at 115200 baud.");
+    Serial.println("[INFO] When STM32 sends a frame, you will see: [RX STM32] T1:...,T2:...\n");
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void loop()
+{
+    /*
+     * Read characters from STM32 UART one at a time.
+     * Accumulate until we see '\n' (end of frame).
+     *
+     * IMPORTANT:
+     *   STM32 must send frames ending with \r\n or at least \n.
+     *   Example from STM32: "T1:25.75,T2:26.50\r\n"
+     */
+    while (Serial2.available())
+    {
+        char c = (char)Serial2.read();
+        lastRxMs = millis();
+
+#if DEBUG_RAW_UART
+        Serial.write(c);   /* raw debug: shows every incoming byte */
+#endif
+
+        if (c == '\n')
+        {
+            rxBuffer.trim();   /* strip \r and any whitespace */
+
+            if (rxBuffer.length() > 0)
+            {
+                /*
+                 * This prints the exact data received from STM32 UART
+                 * on the Heltec USB Serial Monitor.
+                 */
+                Serial.print("[RX STM32] ");
+                Serial.println(rxBuffer);
+
+                transmitLoRa(rxBuffer);
+            }
+
+            rxBuffer = "";     /* reset for next frame */
+        }
+        else if (c != '\r')
+        {
+            rxBuffer += c;
+
+            /* Safety: discard if buffer grows abnormally (no newline received) */
+            if (rxBuffer.length() > 128)
+            {
+                Serial.print("[WARN] UART buffer overflow â€” discarding: ");
+                Serial.println(rxBuffer);
+                rxBuffer = "";
+            }
+        }
+    }
+
+    /*
+     * Helpful message if Heltec is powered but no STM32 UART frame is arriving.
+     * It prints once every 5 seconds only when no data is being received.
+     */
+    if ((millis() - lastRxMs > 5000) && (millis() - lastWaitMs > 5000))
+    {
+        lastWaitMs = millis();
+        Serial.println("[WAIT] No STM32 UART data yet. Check PA9->GPIO16, GND, baud=115200, and newline.");
+    }
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ * transmitLoRa
+ *   Wraps the payload string in a LoRa packet and transmits it.
+ *   Also prints debug info to USB Serial.
+ * â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+void transmitLoRa(const String &payload)
+{
+    packetCount++;
+
+    Serial.print("[TX LoRa #");
+    Serial.print(packetCount);
+    Serial.print("] ");
+    Serial.println(payload);
+
+    LoRa.beginPacket();
+    LoRa.print(payload);
+    bool ok = LoRa.endPacket(false);   /* false = blocking (waits until sent) */
+
+    if (ok)
+    {
+        Serial.println("       â†’ Packet sent OK");
+    }
+    else
+    {
+        Serial.println("       â†’ ERROR: packet not sent");
+    }
+}
+
+/* =============================================================================
+ * OPTIONAL: LoRa RECEIVER SKETCH (run this on a second ESP32/LoRa board)
+ * =============================================================================
+ * To verify the system is working, flash this to a second LoRa device:
+ *
+ *   #include <SPI.h>
+ *   #include <LoRa.h>
+ *
+ *   void setup() {
+ *     Serial.begin(115200);
+ *     SPI.begin(5, 19, 27, 18);
+ *     LoRa.setPins(18, 14, 26);
+ *     LoRa.begin(868E6);
+ *     LoRa.setSpreadingFactor(7);
+ *     LoRa.setSignalBandwidth(125E3);
+ *     LoRa.setCodingRate4(5);
+ *     LoRa.setSyncWord(0x12);
+ *     LoRa.enableCrc();
+ *     Serial.println("Receiver ready");
+ *   }
+ *
+ *   void loop() {
+ *     int pktSize = LoRa.parsePacket();
+ *     if (pktSize) {
+ *       String msg = "";
+ *       while (LoRa.available()) msg += (char)LoRa.read();
+ *       Serial.print("Received: "); Serial.print(msg);
+ *       Serial.print("  RSSI: "); Serial.println(LoRa.packetRssi());
+ *     }
+ *   }
+ * =============================================================================
+ */
